@@ -16,7 +16,7 @@ QUESTION_BANK = [
         "answer": "Mars",
     },
 ]
-ROUND_DURATION = 60       # seconds — default duration for a round
+ROUND_DURATION = 15      # seconds — default duration for a round
 MAX_POINTS = 1000         # points for an instant correct answer
 MIN_POINTS = 100          # floor for a slow-but-correct answer
 
