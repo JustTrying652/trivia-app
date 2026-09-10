@@ -1,6 +1,7 @@
 import asyncio
 import json
 import time
+import uuid
 
 from channels.generic.websocket import AsyncWebsocketConsumer
 
@@ -16,9 +17,10 @@ QUESTION_BANK = [
         "answer": "Mars",
     },
 ]
-ROUND_DURATION = 15      # seconds — default duration for a round
-MAX_POINTS = 1000         # points for an instant correct answer
-MIN_POINTS = 100          # floor for a slow-but-correct answer
+ROUND_DURATION = 15
+MAX_POINTS = 1000
+MIN_POINTS = 100
+GRACE_PERIOD = 30   # seconds a disconnected player's spot is held before removal
 
 
 class RoomConsumer(AsyncWebsocketConsumer):
@@ -30,55 +32,86 @@ class RoomConsumer(AsyncWebsocketConsumer):
 
         if self.room_code not in self.rooms:
             self.rooms[self.room_code] = {
-                "players": {},                  # channel_name -> nickname
-                "scores": {},                   # channel_name -> total score
-                "host": None,                   # channel_name of whoever can start rounds
+                "players": {},            # player_id -> nickname
+                "scores": {},             # player_id -> total score
+                "answered": set(),        # player_ids that answered this round
+                "host": None,             # player_id
+                "connections": {},        # player_id -> channel_name (None if offline)
+                "channel_to_player": {},  # channel_name -> player_id (this process only)
+                "pending_removal": {},    # player_id -> asyncio task (grace timer)
                 "question_index": -1,
-                "round_ends_at": 0.0,           # server timestamp when the round ends
-                "round_duration": ROUND_DURATION,  # authoritative duration for the active round
-                "round_open": False,            # is a round currently accepting answers?
-                "answered": set(),              # channel_names that already answered this round
-                "round_task": None,             # asyncio task counting down the current round
+                "round_ends_at": 0.0,
+                "round_duration": ROUND_DURATION,
+                "round_open": False,
+                "round_task": None,
             }
 
-        await self.channel_layer.group_add(
-            self.room_group_name,
-            self.channel_name,
-        )
+        await self.channel_layer.group_add(self.room_group_name, self.channel_name)
         await self.accept()
+        # Note: no player identity yet — that's established by the "join" message,
+        # since that's the first point we have a nickname and (maybe) a returning player_id.
 
     async def disconnect(self, close_code):
         room = self.rooms.get(self.room_code)
+        await self.channel_layer.group_discard(self.room_group_name, self.channel_name)
+
         if not room:
-            await self.channel_layer.group_discard(
-                self.room_group_name, self.channel_name
-            )
             return
 
-        removed_nickname = room["players"].pop(self.channel_name, None)
-        room["scores"].pop(self.channel_name, None)
-        room["answered"].discard(self.channel_name)
+        player_id = room["channel_to_player"].pop(self.channel_name, None)
+        if player_id is None:
+            return  # they disconnected before ever completing a join
 
-        if room["host"] == self.channel_name:
+        # Mark offline rather than deleting — this is the whole point of the grace period.
+        room["connections"][player_id] = None
+
+        task = asyncio.create_task(self._remove_after_grace(self.room_code, player_id))
+        room["pending_removal"][player_id] = task
+
+    async def _remove_after_grace(self, room_code, player_id):
+        await asyncio.sleep(GRACE_PERIOD)
+
+        room = self.rooms.get(room_code)
+        if not room:
+            return
+
+        # If they reconnected, connections[player_id] will be a real channel_name again — bail.
+        if room["connections"].get(player_id) is not None:
+            return
+
+        nickname = room["players"].pop(player_id, None)
+        room["scores"].pop(player_id, None)
+        room["answered"].discard(player_id)
+        room["connections"].pop(player_id, None)
+        room["pending_removal"].pop(player_id, None)
+
+        if room["host"] == player_id:
             room["host"] = next(iter(room["players"]), None)
 
         if not room["players"]:
             if room["round_task"]:
                 room["round_task"].cancel()
-            del self.rooms[self.room_code]
-        else:
-            await self.channel_layer.group_send(
-                self.room_group_name,
-                {
-                    "type": "player_list",
-                    "players": list(room["players"].values()),
-                    "nickname": removed_nickname,
-                },
-            )
+            del self.rooms[room_code]
+            return
 
-        await self.channel_layer.group_discard(
-            self.room_group_name, self.channel_name
+        await self.channel_layer.group_send(
+            f"room_{room_code}",
+            {
+                "type": "player_list",
+                "players": self._player_list_payload(room),
+                "nickname": nickname,
+            },
         )
+
+    def _player_list_payload(self, room):
+        # Includes online/offline status so the frontend can show "reconnecting..."
+        return [
+            {
+                "nickname": nickname,
+                "online": room["connections"].get(pid) is not None,
+            }
+            for pid, nickname in room["players"].items()
+        ]
 
     async def receive(self, text_data):
         data = json.loads(text_data)
@@ -89,40 +122,76 @@ class RoomConsumer(AsyncWebsocketConsumer):
 
         if message_type == "join":
             await self._handle_join(room, data)
+            return
 
-        elif message_type == "start_round":
-            await self._handle_start_round(room)
+        # Every other message type requires an established identity first.
+        player_id = room["channel_to_player"].get(self.channel_name)
+        if player_id is None:
+            await self._send_error("You must join before sending this.")
+            return
 
+        if message_type == "start_round":
+            await self._handle_start_round(room, player_id)
         elif message_type == "answer":
-            await self._handle_answer(room, data)
-
-    # ---------------- handlers ----------------
+            await self._handle_answer(room, player_id, data)
 
     async def _handle_join(self, room, data):
         nickname = data.get("nickname", "Anonymous")
-        room["players"][self.channel_name] = nickname
-        room["scores"].setdefault(self.channel_name, 0)
+        requested_id = data.get("player_id")
 
-        if room["host"] is None:
-            room["host"] = self.channel_name
+        is_reconnect = requested_id in room["players"]
+
+        if is_reconnect:
+            player_id = requested_id
+            # Cancel the pending grace-period removal — they made it back in time.
+            pending = room["pending_removal"].pop(player_id, None)
+            if pending:
+                pending.cancel()
+        else:
+            player_id = str(uuid.uuid4())
+            room["players"][player_id] = nickname
+            room["scores"].setdefault(player_id, 0)
+            if room["host"] is None:
+                room["host"] = player_id
+
+        room["connections"][player_id] = self.channel_name
+        room["channel_to_player"][self.channel_name] = player_id
+
+        # Tell this client its identity so it can send it back on a future reconnect.
+        await self.send(text_data=json.dumps({
+            "type": "joined",
+            "player_id": player_id,
+            "reconnected": is_reconnect,
+        }))
 
         await self.channel_layer.group_send(
             self.room_group_name,
             {
                 "type": "player_list",
-                "players": list(room["players"].values()),
-                "nickname": nickname,
+                "players": self._player_list_payload(room),
+                "nickname": room["players"][player_id],
             },
         )
 
-    async def _handle_start_round(self, room):
-        if self.channel_name != room["host"]:
-            return  # only host can start rounds
+        # Catch a reconnecting player up on an in-progress round.
+        if is_reconnect and room["round_open"]:
+            question = QUESTION_BANK[room["question_index"]]
+            await self.send(text_data=json.dumps({
+                "type": "question_start",
+                "question": question["question"],
+                "options": question["options"],
+                "duration": room["round_duration"],
+                "ends_at": room["round_ends_at"],
+                "already_answered": player_id in room["answered"],
+            }))
+
+    async def _handle_start_round(self, room, player_id):
+        if player_id != room["host"]:
+            return
 
         room["question_index"] = (room["question_index"] + 1) % len(QUESTION_BANK)
         question = QUESTION_BANK[room["question_index"]]
 
-        # This is the ONE place duration is decided. Everyone else reads it from the room.
         duration = ROUND_DURATION
         ends_at = time.time() + duration
 
@@ -139,6 +208,7 @@ class RoomConsumer(AsyncWebsocketConsumer):
                 "options": question["options"],
                 "duration": duration,
                 "ends_at": ends_at,
+                "already_answered": False,
             },
         )
 
@@ -148,21 +218,18 @@ class RoomConsumer(AsyncWebsocketConsumer):
             self.end_round_after_delay(self.room_code, room["question_index"])
         )
 
-    async def _handle_answer(self, room, data):
+    async def _handle_answer(self, room, player_id, data):
         now = time.time()
 
-        # 1) Round must be open and not past its deadline
         if not room["round_open"] or now >= room["round_ends_at"]:
             await self._send_error("Round is closed.")
             return
 
-        # 2) One answer per player per round
-        if self.channel_name in room["answered"]:
+        if player_id in room["answered"]:
             await self._send_error("You already answered this round.")
             return
 
-        # Lock in immediately so a duplicate can't slip through in the same tick
-        room["answered"].add(self.channel_name)
+        room["answered"].add(player_id)
 
         choice = data.get("choice")
         question = QUESTION_BANK[room["question_index"]]
@@ -173,52 +240,41 @@ class RoomConsumer(AsyncWebsocketConsumer):
             time_remaining = max(0.0, room["round_ends_at"] - now)
             ratio = time_remaining / room["round_duration"]
             points = max(MIN_POINTS, round(MAX_POINTS * ratio))
-            room["scores"][self.channel_name] = (
-                room["scores"].get(self.channel_name, 0) + points
-            )
+            room["scores"][player_id] = room["scores"].get(player_id, 0) + points
 
-        # Acknowledge to the answering player only
         await self.send(text_data=json.dumps({
             "type": "answer_result",
             "correct": correct,
             "points": points,
-            "total": room["scores"].get(self.channel_name, 0),
+            "total": room["scores"].get(player_id, 0),
         }))
 
-        # Broadcast who answered (optional — for a "locked in" indicator)
         await self.channel_layer.group_send(
             self.room_group_name,
-            {
-                "type": "player_answered",
-                "nickname": room["players"].get(self.channel_name, "?"),
-            },
+            {"type": "player_answered", "nickname": room["players"].get(player_id, "?")},
         )
 
     async def _send_error(self, msg):
         await self.send(text_data=json.dumps({"type": "error", "message": msg}))
 
     async def end_round_after_delay(self, room_code, question_index):
-        # Read the room BEFORE sleeping so we bail early if it's already gone
         room = self.rooms.get(room_code)
         if not room or room["question_index"] != question_index:
             return
 
         await asyncio.sleep(room["round_duration"])
 
-        # Re-check after sleeping — a new round may have started (or the room vanished)
         room = self.rooms.get(room_code)
         if not room or room["question_index"] != question_index:
-            return  # room gone, or a new round already started
+            return
 
         room["round_open"] = False
         question = QUESTION_BANK[question_index]
 
-        # Build the scoreboard
         scoreboard = sorted(
             (
-                {"nickname": room["players"].get(ch, "?"), "score": score}
-                for ch, score in room["scores"].items()
-                if ch in room["players"]
+                {"nickname": nickname, "score": room["scores"].get(pid, 0)}
+                for pid, nickname in room["players"].items()
             ),
             key=lambda p: p["score"],
             reverse=True,
@@ -226,14 +282,10 @@ class RoomConsumer(AsyncWebsocketConsumer):
 
         await self.channel_layer.group_send(
             f"room_{room_code}",
-            {
-                "type": "round_end",
-                "answer": question["answer"],
-                "scoreboard": scoreboard,
-            },
+            {"type": "round_end", "answer": question["answer"], "scoreboard": scoreboard},
         )
 
-    # ---------------- group event handlers (server -> client forwarding) ----------------
+    # ---------------- group event handlers ----------------
 
     async def player_list(self, event):
         await self.send(text_data=json.dumps({
