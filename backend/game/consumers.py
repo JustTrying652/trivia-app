@@ -16,7 +16,9 @@ QUESTION_BANK = [
         "answer": "Mars",
     },
 ]
-ROUND_DURATION = 15  # seconds
+ROUND_DURATION = 15       # seconds
+MAX_POINTS = 1000         # points for an instant correct answer
+MIN_POINTS = 100          # floor for a slow-but-correct answer
 
 
 class RoomConsumer(AsyncWebsocketConsumer):
@@ -28,108 +30,203 @@ class RoomConsumer(AsyncWebsocketConsumer):
 
         if self.room_code not in self.rooms:
             self.rooms[self.room_code] = {
-                "players": {},        # channel_name -> nickname
-                "host": None,         # channel_name of whoever can start rounds
+                "players": {},          # channel_name -> nickname
+                "scores": {},           # channel_name -> total score
+                "host": None,
                 "question_index": -1,
-                "round_task": None,   # asyncio task counting down the current round
+                "round_ends_at": 0.0,   # server timestamp when the round ends
+                "round_open": False,    # is a round currently accepting answers?
+                "answered": set(),      # channel_names that already answered this round
+                "round_task": None,
             }
 
         await self.channel_layer.group_add(
             self.room_group_name,
-            self.channel_name
+            self.channel_name,
         )
-
         await self.accept()
 
     async def disconnect(self, close_code):
         room = self.rooms.get(self.room_code)
+        if not room:
+            await self.channel_layer.group_discard(
+                self.room_group_name, self.channel_name
+            )
+            return
 
-        if room:
-            removed_nickname = room["players"].pop(self.channel_name, None)
+        removed_nickname = room["players"].pop(self.channel_name, None)
+        room["scores"].pop(self.channel_name, None)
+        room["answered"].discard(self.channel_name)
 
-            if room["host"] == self.channel_name:
-                room["host"] = next(iter(room["players"]), None)
+        if room["host"] == self.channel_name:
+            room["host"] = next(iter(room["players"]), None)
 
-            if not room["players"]:
-                if room["round_task"]:
-                    room["round_task"].cancel()
-                del self.rooms[self.room_code]
-            else:
-                await self.channel_layer.group_send(
-                    self.room_group_name,
-                    {
-                        "type": "player_list",
-                        "players": list(room["players"].values()),
-                        "nickname": removed_nickname,
-                    }
-                )
+        if not room["players"]:
+            if room["round_task"]:
+                room["round_task"].cancel()
+            del self.rooms[self.room_code]
+        else:
+            await self.channel_layer.group_send(
+                self.room_group_name,
+                {
+                    "type": "player_list",
+                    "players": list(room["players"].values()),
+                    "nickname": removed_nickname,
+                },
+            )
 
         await self.channel_layer.group_discard(
-            self.room_group_name,
-            self.channel_name
+            self.room_group_name, self.channel_name
         )
 
     async def receive(self, text_data):
         data = json.loads(text_data)
         message_type = data.get("type")
         room = self.rooms.get(self.room_code)
+        if not room:
+            return
 
         if message_type == "join":
-            nickname = data.get("nickname", "Anonymous")
-            room["players"][self.channel_name] = nickname
-
-            if room["host"] is None:
-                room["host"] = self.channel_name
-
-            await self.channel_layer.group_send(
-                self.room_group_name,
-                {
-                    "type": "player_list",
-                    "players": list(room["players"].values()),
-                    "nickname": nickname,
-                }
-            )
+            await self._handle_join(room, data)
 
         elif message_type == "start_round":
-            if self.channel_name != room["host"]:
-                return  # only host can start rounds
+            await self._handle_start_round(room)
 
-            room["question_index"] = (room["question_index"] + 1) % len(QUESTION_BANK)
-            question = QUESTION_BANK[room["question_index"]]
-            duration = ROUND_DURATION
-            ends_at = time.time() + duration
+        elif message_type == "answer":
+            await self._handle_answer(room, data)
 
-            await self.channel_layer.group_send(
-                self.room_group_name,
-                {
-                    "type": "question_start",
-                    "question": question["question"],
-                    "options": question["options"],
-                    "duration": duration,
-                    "ends_at": ends_at,
-                }
+    # ---------------- handlers ----------------
+
+    async def _handle_join(self, room, data):
+        nickname = data.get("nickname", "Anonymous")
+        room["players"][self.channel_name] = nickname
+        room["scores"].setdefault(self.channel_name, 0)
+
+        if room["host"] is None:
+            room["host"] = self.channel_name
+
+        await self.channel_layer.group_send(
+            self.room_group_name,
+            {
+                "type": "player_list",
+                "players": list(room["players"].values()),
+                "nickname": nickname,
+            },
+        )
+
+    async def _handle_start_round(self, room):
+        if self.channel_name != room["host"]:
+            return  # only host can start rounds
+
+        room["question_index"] = (room["question_index"] + 1) % len(QUESTION_BANK)
+        question = QUESTION_BANK[room["question_index"]]
+
+        duration = ROUND_DURATION
+        ends_at = time.time() + duration
+
+        room["round_ends_at"] = ends_at
+        room["round_open"] = True
+        room["answered"] = set()
+
+        await self.channel_layer.group_send(
+            self.room_group_name,
+            {
+                "type": "question_start",
+                "question": question["question"],
+                "options": question["options"],
+                "duration": duration,
+                "ends_at": ends_at,
+            },
+        )
+
+        if room["round_task"]:
+            room["round_task"].cancel()
+        room["round_task"] = asyncio.create_task(
+            self.end_round_after_delay(
+                self.room_code, room["question_index"], duration
+            )
+        )
+
+    async def _handle_answer(self, room, data):
+        now = time.time()
+
+        # 1) Round must be open and not past its deadline
+        if not room["round_open"] or now >= room["round_ends_at"]:
+            await self._send_error("Round is closed.")
+            return
+
+        # 2) One answer per player per round
+        if self.channel_name in room["answered"]:
+            await self._send_error("You already answered this round.")
+            return
+
+        # Lock in immediately so a duplicate can't slip through in the same tick
+        room["answered"].add(self.channel_name)
+
+        choice = data.get("choice")
+        question = QUESTION_BANK[room["question_index"]]
+        correct = (choice == question["answer"])
+
+        points = 0
+        if correct:
+            time_remaining = max(0.0, room["round_ends_at"] - now)
+            ratio = time_remaining / ROUND_DURATION
+            points = max(MIN_POINTS, round(MAX_POINTS * ratio))
+            room["scores"][self.channel_name] = (
+                room["scores"].get(self.channel_name, 0) + points
             )
 
-            if room["round_task"]:
-                room["round_task"].cancel()
-            room["round_task"] = asyncio.create_task(
-                self.end_round_after_delay(self.room_code, room["question_index"], duration)
-            )
+        # Acknowledge to the answering player only
+        await self.send(text_data=json.dumps({
+            "type": "answer_result",
+            "correct": correct,
+            "points": points,
+            "total": room["scores"].get(self.channel_name, 0),
+        }))
+
+        # Broadcast who answered (optional — for a "locked in" indicator)
+        await self.channel_layer.group_send(
+            self.room_group_name,
+            {
+                "type": "player_answered",
+                "nickname": room["players"].get(self.channel_name, "?"),
+            },
+        )
+
+    async def _send_error(self, msg):
+        await self.send(text_data=json.dumps({"type": "error", "message": msg}))
 
     async def end_round_after_delay(self, room_code, question_index, duration):
         await asyncio.sleep(duration)
 
         room = self.rooms.get(room_code)
         if not room or room["question_index"] != question_index:
-            return  # room gone, or a new round already started
+            return
 
+        room["round_open"] = False
         question = QUESTION_BANK[question_index]
-        await self.channel_layer.group_send(
-            f"room_{room_code}",
-            {"type": "round_end", "answer": question["answer"]},
+
+        # Build the scoreboard
+        scoreboard = sorted(
+            (
+                {"nickname": room["players"].get(ch, "?"), "score": score}
+                for ch, score in room["scores"].items()
+                if ch in room["players"]
+            ),
+            key=lambda p: p["score"],
+            reverse=True,
         )
 
-    # --- group event handlers (server -> client forwarding) ---
+        await self.channel_layer.group_send(
+            f"room_{room_code}",
+            {
+                "type": "round_end",
+                "answer": question["answer"],
+                "scoreboard": scoreboard,
+            },
+        )
+
+    # ---------------- group event handlers ----------------
 
     async def player_list(self, event):
         await self.send(text_data=json.dumps({
@@ -147,8 +244,15 @@ class RoomConsumer(AsyncWebsocketConsumer):
             "ends_at": event["ends_at"],
         }))
 
+    async def player_answered(self, event):
+        await self.send(text_data=json.dumps({
+            "type": "player_answered",
+            "nickname": event["nickname"],
+        }))
+
     async def round_end(self, event):
         await self.send(text_data=json.dumps({
             "type": "round_end",
             "answer": event["answer"],
+            "scoreboard": event["scoreboard"],
         }))
