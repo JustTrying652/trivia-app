@@ -16,7 +16,7 @@ QUESTION_BANK = [
         "answer": "Mars",
     },
 ]
-ROUND_DURATION = 15       # seconds
+ROUND_DURATION = 15       # seconds — default duration for a round
 MAX_POINTS = 1000         # points for an instant correct answer
 MIN_POINTS = 100          # floor for a slow-but-correct answer
 
@@ -30,14 +30,15 @@ class RoomConsumer(AsyncWebsocketConsumer):
 
         if self.room_code not in self.rooms:
             self.rooms[self.room_code] = {
-                "players": {},          # channel_name -> nickname
-                "scores": {},           # channel_name -> total score
-                "host": None,
+                "players": {},                  # channel_name -> nickname
+                "scores": {},                   # channel_name -> total score
+                "host": None,                   # channel_name of whoever can start rounds
                 "question_index": -1,
-                "round_ends_at": 0.0,   # server timestamp when the round ends
-                "round_open": False,    # is a round currently accepting answers?
-                "answered": set(),      # channel_names that already answered this round
-                "round_task": None,
+                "round_ends_at": 0.0,           # server timestamp when the round ends
+                "round_duration": ROUND_DURATION,  # authoritative duration for the active round
+                "round_open": False,            # is a round currently accepting answers?
+                "answered": set(),              # channel_names that already answered this round
+                "round_task": None,             # asyncio task counting down the current round
             }
 
         await self.channel_layer.group_add(
@@ -121,10 +122,12 @@ class RoomConsumer(AsyncWebsocketConsumer):
         room["question_index"] = (room["question_index"] + 1) % len(QUESTION_BANK)
         question = QUESTION_BANK[room["question_index"]]
 
+        # This is the ONE place duration is decided. Everyone else reads it from the room.
         duration = ROUND_DURATION
         ends_at = time.time() + duration
 
         room["round_ends_at"] = ends_at
+        room["round_duration"] = duration
         room["round_open"] = True
         room["answered"] = set()
 
@@ -142,9 +145,7 @@ class RoomConsumer(AsyncWebsocketConsumer):
         if room["round_task"]:
             room["round_task"].cancel()
         room["round_task"] = asyncio.create_task(
-            self.end_round_after_delay(
-                self.room_code, room["question_index"], duration
-            )
+            self.end_round_after_delay(self.room_code, room["question_index"])
         )
 
     async def _handle_answer(self, room, data):
@@ -170,7 +171,7 @@ class RoomConsumer(AsyncWebsocketConsumer):
         points = 0
         if correct:
             time_remaining = max(0.0, room["round_ends_at"] - now)
-            ratio = time_remaining / ROUND_DURATION
+            ratio = time_remaining / room["round_duration"]
             points = max(MIN_POINTS, round(MAX_POINTS * ratio))
             room["scores"][self.channel_name] = (
                 room["scores"].get(self.channel_name, 0) + points
@@ -196,12 +197,18 @@ class RoomConsumer(AsyncWebsocketConsumer):
     async def _send_error(self, msg):
         await self.send(text_data=json.dumps({"type": "error", "message": msg}))
 
-    async def end_round_after_delay(self, room_code, question_index, duration):
-        await asyncio.sleep(duration)
-
+    async def end_round_after_delay(self, room_code, question_index):
+        # Read the room BEFORE sleeping so we bail early if it's already gone
         room = self.rooms.get(room_code)
         if not room or room["question_index"] != question_index:
             return
+
+        await asyncio.sleep(room["round_duration"])
+
+        # Re-check after sleeping — a new round may have started (or the room vanished)
+        room = self.rooms.get(room_code)
+        if not room or room["question_index"] != question_index:
+            return  # room gone, or a new round already started
 
         room["round_open"] = False
         question = QUESTION_BANK[question_index]
@@ -226,7 +233,7 @@ class RoomConsumer(AsyncWebsocketConsumer):
             },
         )
 
-    # ---------------- group event handlers ----------------
+    # ---------------- group event handlers (server -> client forwarding) ----------------
 
     async def player_list(self, event):
         await self.send(text_data=json.dumps({
