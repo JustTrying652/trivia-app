@@ -26,25 +26,29 @@ GRACE_PERIOD = 30   # seconds a disconnected player's spot is held before remova
 class RoomConsumer(AsyncWebsocketConsumer):
     rooms = {}
 
+    def create_room_state():
+        return {
+          "players": {},
+          "scores": {},
+          "answered": set(),
+          "host": None,
+          "connections": {},
+          "channel_to_player": {},
+          "pending_removal": {},
+          "question_index": -1,
+          "round_ends_at": 0.0,
+          "round_duration": ROUND_DURATION,
+          "round_open": False,
+          "round_task": None,
+        }
+
     async def connect(self):
         self.room_code = self.scope["url_route"]["kwargs"]["room_code"]
         self.room_group_name = f"room_{self.room_code}"
 
         if self.room_code not in self.rooms:
-            self.rooms[self.room_code] = {
-                "players": {},            # player_id -> nickname
-                "scores": {},             # player_id -> total score
-                "answered": set(),        # player_ids that answered this round
-                "host": None,             # player_id
-                "connections": {},        # player_id -> channel_name (None if offline)
-                "channel_to_player": {},  # channel_name -> player_id (this process only)
-                "pending_removal": {},    # player_id -> asyncio task (grace timer)
-                "question_index": -1,
-                "round_ends_at": 0.0,
-                "round_duration": ROUND_DURATION,
-                "round_open": False,
-                "round_task": None,
-            }
+            self.rooms[self.room_code] = create_room_state()
+            
 
         await self.channel_layer.group_add(self.room_group_name, self.channel_name)
         await self.accept()
