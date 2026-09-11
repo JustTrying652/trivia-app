@@ -26,6 +26,7 @@ GRACE_PERIOD = 30   # seconds a disconnected player's spot is held before remova
 class RoomConsumer(AsyncWebsocketConsumer):
     rooms = {}
 
+    @staticmethod
     def create_room_state():
         return {
           "players": {},
@@ -47,7 +48,7 @@ class RoomConsumer(AsyncWebsocketConsumer):
         self.room_group_name = f"room_{self.room_code}"
 
         if self.room_code not in self.rooms:
-            self.rooms[self.room_code] = create_room_state()
+            self.rooms[self.room_code] = self.create_room_state()
             
 
         await self.channel_layer.group_add(self.room_group_name, self.channel_name)
