@@ -12,7 +12,7 @@ export function useRoomSocket(roomCode, nickname) {
 
   useEffect(() => {
     const storageKey = `trivia:player_id:${roomCode}`
-    const storedPlayerId = localStorage.getItem(storageKey)
+    const storedPlayerId = sessionStorage.getItem(storageKey)
 
     const ws = new WebSocket(`ws://127.0.0.1:8000/ws/room/${roomCode}/`)
     wsRef.current = ws
@@ -28,12 +28,12 @@ export function useRoomSocket(roomCode, nickname) {
 
     ws.onmessage = (event) => {
       const msg = JSON.parse(event.data)
-      console.log('[ws]', msg)   // temporary — remove once this is diagnosed
+      console.log('[ws]', JSON.stringify(msg))   // temporary — remove once this is diagnosed
 
       switch (msg.type) {
         case 'joined':
           setMyPlayerId(msg.player_id)
-          localStorage.setItem(storageKey, msg.player_id)
+          sessionStorage.setItem(storageKey, msg.player_id)
           break
         case 'player_list':
           setPlayers(msg.players)
