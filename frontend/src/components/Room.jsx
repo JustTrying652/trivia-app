@@ -1,5 +1,6 @@
 import { useRoomSocket } from '../hooks/useRoomSocket'
 import Lobby from './Lobby'
+import GameRound from './GameRound'
 
 export default function Room({ roomCode, nickname }) {
   const {
@@ -7,14 +8,15 @@ export default function Room({ roomCode, nickname }) {
     players,
     isHost,
     question,
+    answerResult,
+    roundResult,
     lastError,
     sendMessage,
   } = useRoomSocket(roomCode, nickname)
 
   const handleStartRound = () => sendMessage({ type: 'start_round' })
+  const handleAnswer = (choice) => sendMessage({ type: 'answer', choice })
 
-  // No active question yet → show the lobby. Once `question` is set, we'll
-  // render the round screen here instead (next step).
   if (!question) {
     return (
       <Lobby
@@ -28,5 +30,14 @@ export default function Room({ roomCode, nickname }) {
     )
   }
 
-  return <p>Round screen goes here next.</p>
+  return (
+    <GameRound
+      question={question}
+      answerResult={answerResult}
+      roundResult={roundResult}
+      isHost={isHost}
+      onAnswer={handleAnswer}
+      onNextRound={handleStartRound}
+    />
+  )
 }
