@@ -17,6 +17,7 @@ QUESTION_BANK = [
         "answer": "Mars",
     },
 ]
+TOTAL_ROUNDS = 10
 ROUND_DURATION = 15
 MAX_POINTS = 1000
 MIN_POINTS = 100
@@ -37,6 +38,8 @@ class RoomConsumer(AsyncWebsocketConsumer):
           "channel_to_player": {},
           "pending_removal": {},
           "question_index": -1,
+          "round_number": 0,
+          "game_over": False,
           "round_ends_at": 0.0,
           "round_duration": ROUND_DURATION,
           "round_open": False,
@@ -194,8 +197,11 @@ class RoomConsumer(AsyncWebsocketConsumer):
     async def _handle_start_round(self, room, player_id):
         if player_id != room["host"]:
             return
+        if room["game_over"]:
+            return  # NEW — no more rounds once the game has ended
 
         room["question_index"] = (room["question_index"] + 1) % len(QUESTION_BANK)
+        room["round_number"] += 1   # NEW
         question = QUESTION_BANK[room["question_index"]]
 
         duration = ROUND_DURATION
@@ -278,17 +284,27 @@ class RoomConsumer(AsyncWebsocketConsumer):
         question = QUESTION_BANK[question_index]
 
         scoreboard = sorted(
-            (
-                {"nickname": nickname, "score": room["scores"].get(pid, 0)}
-                for pid, nickname in room["players"].items()
+           (
+              {"nickname": nickname, "score": room["scores"].get(pid, 0)}
+              for pid, nickname in room["players"].items()
             ),
             key=lambda p: p["score"],
             reverse=True,
         )
 
+        game_over = room["round_number"] >= TOTAL_ROUNDS   # NEW
+        room["game_over"] = game_over                       # NEW
+
         await self.channel_layer.group_send(
-            f"room_{room_code}",
-            {"type": "round_end", "answer": question["answer"], "scoreboard": scoreboard},
+           f"room_{room_code}",
+           {
+              "type": "round_end",
+              "answer": question["answer"],
+              "scoreboard": scoreboard,
+              "game_over": game_over,              # NEW
+              "round_number": room["round_number"], # NEW
+              "total_rounds": TOTAL_ROUNDS,          # NEW
+            },
         )
 
     # ---------------- group event handlers ----------------
@@ -320,4 +336,7 @@ class RoomConsumer(AsyncWebsocketConsumer):
             "type": "round_end",
             "answer": event["answer"],
             "scoreboard": event["scoreboard"],
+            "game_over": event["game_over"],
+            "round_number": event["round_number"],
+            "total_rounds": event["total_rounds"],
         }))
