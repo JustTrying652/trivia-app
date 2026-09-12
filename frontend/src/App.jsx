@@ -1,19 +1,15 @@
 import { useState } from 'react'
 import JoinScreen from './components/JoinScreen'
+import Room from './components/Room'
 
 function App() {
-  const [session, setSession] = useState(null) // { nickname, roomCode }
+  const [session, setSession] = useState(null)
 
   if (!session) {
     return <JoinScreen onJoin={setSession} />
   }
 
-  return (
-    <div style={{ padding: 24 }}>
-      <p>Joined as {session.nickname} in room {session.roomCode}</p>
-      <p>(Lobby screen comes next)</p>
-    </div>
-  )
+  return <Room roomCode={session.roomCode} nickname={session.nickname} />
 }
 
 export default App
