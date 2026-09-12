@@ -28,6 +28,7 @@ export function useRoomSocket(roomCode, nickname) {
 
     ws.onmessage = (event) => {
       const msg = JSON.parse(event.data)
+      console.log('[ws]', msg)   // temporary — remove once this is diagnosed
 
       switch (msg.type) {
         case 'joined':
