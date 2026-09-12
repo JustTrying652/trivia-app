@@ -17,7 +17,7 @@ QUESTION_BANK = [
         "answer": "Mars",
     },
 ]
-TOTAL_ROUNDS = 10
+TOTAL_ROUNDS = 2
 ROUND_DURATION = 15
 MAX_POINTS = 1000
 MIN_POINTS = 100

@@ -1,6 +1,7 @@
 import { useRoomSocket } from '../hooks/useRoomSocket'
 import Lobby from './Lobby'
 import GameRound from './GameRound'
+import GameOverScreen from './GameOverScreen'
 
 export default function Room({ roomCode, nickname }) {
   const {
@@ -16,6 +17,10 @@ export default function Room({ roomCode, nickname }) {
 
   const handleStartRound = () => sendMessage({ type: 'start_round' })
   const handleAnswer = (choice) => sendMessage({ type: 'answer', choice })
+
+  if (roundResult?.game_over) {
+    return <GameOverScreen scoreboard={roundResult.scoreboard} />
+  }
 
   if (!question) {
     return (
