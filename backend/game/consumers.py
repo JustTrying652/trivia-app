@@ -175,7 +175,7 @@ class RoomConsumer(AsyncWebsocketConsumer):
 
         # Catch a reconnecting player up on an in-progress round.
         if is_reconnect and room["round_open"]:
-            question = QUESTION_BANK[room["question_index"]]
+            question = room["questions"][room["question_index"]]
             await self.send(text_data=json.dumps({
                 "type": "question_start",
                 "question": question["question"],
@@ -192,6 +192,7 @@ class RoomConsumer(AsyncWebsocketConsumer):
             return  # NEW — no more rounds once the game has ended
 
         room["question_index"] = (room["question_index"] + 1) % len(room["questions"])
+        room["round_number"] += 1
         question = room["questions"][room["question_index"]]
 
         duration = ROUND_DURATION
