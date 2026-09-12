@@ -109,13 +109,14 @@ class RoomConsumer(AsyncWebsocketConsumer):
         )
 
     def _player_list_payload(self, room):
-        # Includes online/offline status so the frontend can show "reconnecting..."
-        return [
-            {
-                "nickname": nickname,
-                "online": room["connections"].get(pid) is not None,
-            }
-            for pid, nickname in room["players"].items()
+       return [
+          {
+             "player_id": pid,
+             "nickname": nickname,
+             "online": room["connections"].get(pid) is not None,
+             "is_host": pid == room["host"],
+          }
+          for pid, nickname in room["players"].items()
         ]
 
     async def receive(self, text_data):
