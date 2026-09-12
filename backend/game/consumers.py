@@ -4,19 +4,9 @@ import time
 import uuid
 
 from channels.generic.websocket import AsyncWebsocketConsumer
+from .trivia_api import FALLBACK_QUESTIONS
 
-QUESTION_BANK = [
-    {
-        "question": "What is the capital of France?",
-        "options": ["Paris", "London", "Berlin", "Madrid"],
-        "answer": "Paris",
-    },
-    {
-        "question": "Which planet is known as the Red Planet?",
-        "options": ["Venus", "Mars", "Jupiter", "Saturn"],
-        "answer": "Mars",
-    },
-]
+
 TOTAL_ROUNDS = 10
 ROUND_DURATION = 15
 MAX_POINTS = 1000
@@ -28,7 +18,7 @@ class RoomConsumer(AsyncWebsocketConsumer):
     rooms = {}
 
     @staticmethod
-    def create_room_state():
+    def create_room_state(questions=None):
         return {
           "players": {},
           "scores": {},
@@ -37,6 +27,7 @@ class RoomConsumer(AsyncWebsocketConsumer):
           "connections": {},
           "channel_to_player": {},
           "pending_removal": {},
+          "questions": questions or FALLBACK_QUESTIONS,
           "question_index": -1,
           "round_number": 0,
           "game_over": False,
@@ -200,9 +191,8 @@ class RoomConsumer(AsyncWebsocketConsumer):
         if room["game_over"]:
             return  # NEW — no more rounds once the game has ended
 
-        room["question_index"] = (room["question_index"] + 1) % len(QUESTION_BANK)
-        room["round_number"] += 1   # NEW
-        question = QUESTION_BANK[room["question_index"]]
+        room["question_index"] = (room["question_index"] + 1) % len(room["questions"])
+        question = room["questions"][room["question_index"]]
 
         duration = ROUND_DURATION
         ends_at = time.time() + duration
@@ -244,7 +234,7 @@ class RoomConsumer(AsyncWebsocketConsumer):
         room["answered"].add(player_id)
 
         choice = data.get("choice")
-        question = QUESTION_BANK[room["question_index"]]
+        question = room["questions"][room["question_index"]]
         correct = (choice == question["answer"])
 
         points = 0
@@ -281,7 +271,7 @@ class RoomConsumer(AsyncWebsocketConsumer):
             return
 
         room["round_open"] = False
-        question = QUESTION_BANK[question_index]
+        question = room["questions"][question_index]
 
         scoreboard = sorted(
            (
