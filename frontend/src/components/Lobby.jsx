@@ -12,7 +12,7 @@ export default function Lobby({ roomCode, connectionStatus, players, isHost, las
         <h2 style={styles.subtitle}>Players ({players.length})</h2>
         <ul style={styles.list}>
           {players.map((p) => (
-            <li key={p.player_id} style={styles.listItem}>
+            <li key={p.player_id} style={{ ...styles.listItem, animation: 'player-enter 0.3s ease-out' }}>
               {p.nickname}
               {!p.online && <span style={styles.offline}> (reconnecting…)</span>}
               {p.is_host && <span style={styles.badge}>host</span>}
