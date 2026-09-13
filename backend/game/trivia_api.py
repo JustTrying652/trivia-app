@@ -18,9 +18,6 @@ FALLBACK_QUESTIONS = [
 
 
 def fetch_questions(amount=10):
-    """Fetch `amount` multiple-choice questions from Open Trivia DB.
-    Falls back to a small local bank if the API is unreachable or errors,
-    so a flaky network never breaks room creation."""
     try:
         response = requests.get(
             "https://opentdb.com/api.php",
@@ -31,7 +28,7 @@ def fetch_questions(amount=10):
         data = response.json()
 
         if data.get("response_code") != 0 or not data.get("results"):
-            return FALLBACK_QUESTIONS
+           return FALLBACK_QUESTIONS
 
         questions = []
         for item in data["results"]:
